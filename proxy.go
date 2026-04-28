@@ -73,19 +73,37 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	defer resp.Body.Close()
 
-	// Copy response headers
-	CopyResponseHeaders(w, resp)
+	log.Printf("[proxy] upstream responded: %d %s (content-type: %s)",
+		resp.StatusCode, resp.Status, resp.Header.Get("Content-Type"))
+
+	// Log error response bodies for debugging
+	if resp.StatusCode >= 400 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		log.Printf("[proxy] error response body: %s", string(bodyBytes))
+		// Still forward the error to the client
+		CopyResponseHeaders(w, resp)
+		w.Write(bodyBytes)
+		return
+	}
+
+	isMessages := strings.Contains(r.URL.Path, "/messages")
+
+	// Copy response headers, removing Content-Length for transformed responses
+	// (transformation may change body size)
+	CopyResponseHeaders(w, resp, isMessages)
 
 	// Transform and stream response
-	isMessages := strings.Contains(r.URL.Path, "/messages")
 	if isMessages && IsSSE(resp) {
 		StreamTransformResponse(w, resp.Body)
+		// StreamTransformResponse closes body
 	} else if isMessages {
 		ReadAndTransformBody(w, resp.Body)
+		// ReadAndTransformBody closes body
 	} else {
 		io.Copy(w, resp.Body)
+		resp.Body.Close()
 	}
 }
 
@@ -118,6 +136,15 @@ func (p *ProxyHandler) doUpstreamRequest(r *http.Request, token string) (*http.R
 	upstream.ContentLength = int64(len(body))
 
 	log.Printf("[proxy] %s %s -> %s (body: %d bytes)", r.Method, r.URL.Path, upstreamURL, len(body))
+
+	// Debug: log outgoing headers
+	for k, vv := range upstream.Header {
+		if strings.EqualFold(k, "Authorization") {
+			log.Printf("[proxy]   >> %s: Bearer %s...%s", k, vv[0][7:17], vv[0][len(vv[0])-4:])
+		} else {
+			log.Printf("[proxy]   >> %s: %s", k, strings.Join(vv, ", "))
+		}
+	}
 
 	return p.httpClient.Do(upstream)
 }

@@ -130,8 +130,13 @@ func IsSSE(resp *http.Response) bool {
 }
 
 // CopyResponseHeaders copies response headers from upstream to client.
-func CopyResponseHeaders(w http.ResponseWriter, resp *http.Response) {
+// If stripContentLength is true, Content-Length is removed (for transformed bodies).
+func CopyResponseHeaders(w http.ResponseWriter, resp *http.Response, stripContentLength ...bool) {
+	strip := len(stripContentLength) > 0 && stripContentLength[0]
 	for k, vv := range resp.Header {
+		if strip && strings.EqualFold(k, "Content-Length") {
+			continue
+		}
 		for _, v := range vv {
 			w.Header().Add(k, v)
 		}

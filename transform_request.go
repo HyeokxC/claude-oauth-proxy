@@ -18,6 +18,11 @@ func TransformRequestHeaders(upstream *http.Request, original *http.Request, tok
 		}
 	}
 
+	// Strip headers that must be rewritten
+	upstream.Header.Del("Accept-Encoding")
+	upstream.Header.Del("Content-Length") // let Go set this from body size
+	upstream.Header.Del("Host")
+
 	// 1. Auth: remove x-api-key, set Bearer token
 	upstream.Header.Del("x-api-key")
 	upstream.Header.Set("Authorization", "Bearer "+token)
@@ -32,8 +37,8 @@ func TransformRequestHeaders(upstream *http.Request, original *http.Request, tok
 	// 4. Anthropic version
 	upstream.Header.Set("anthropic-version", AnthropicVersion)
 
-	// Remove host header (will be set by transport)
-	upstream.Header.Del("Host")
+	// 5. User-Agent: must look like Claude Code
+	upstream.Header.Set("User-Agent", fmt.Sprintf("claude-code/%s", CCVersion))
 }
 
 func transformBetaHeaders(req *http.Request) {
