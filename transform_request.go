@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"regexp"
@@ -10,7 +9,7 @@ import (
 )
 
 // TransformRequestHeaders replaces auth and injects required headers.
-func TransformRequestHeaders(upstream *http.Request, original *http.Request, token string) {
+func TransformRequestHeaders(upstream *http.Request, original *http.Request, token string) error {
 	// Copy all headers from original
 	for k, vv := range original.Header {
 		for _, v := range vv {
@@ -27,9 +26,16 @@ func TransformRequestHeaders(upstream *http.Request, original *http.Request, tok
 	upstream.Header.Del("x-api-key")
 	upstream.Header.Set("Authorization", "Bearer "+token)
 
-	// 2. Billing header
-	upstream.Header.Set("x-anthropic-billing-header",
-		fmt.Sprintf("cc_version=%s.cli; cc_entrypoint=cli; cch=00000;", CCVersion))
+	upstream.Header.Del("x-anthropic-billing-header")
+	upstream.Header.Set("x-app", "cli")
+	upstream.Header.Set("anthropic-dangerous-direct-browser-access", "true")
+	if !validSessionID(upstream.Header.Get("x-claude-code-session-id")) {
+		session, err := newSessionID()
+		if err != nil {
+			return err
+		}
+		upstream.Header.Set("x-claude-code-session-id", session)
+	}
 
 	// 3. Beta headers: merge required, strip unwanted
 	transformBetaHeaders(upstream)
@@ -38,7 +44,8 @@ func TransformRequestHeaders(upstream *http.Request, original *http.Request, tok
 	upstream.Header.Set("anthropic-version", AnthropicVersion)
 
 	// 5. User-Agent: must look like Claude Code
-	upstream.Header.Set("User-Agent", fmt.Sprintf("claude-code/%s", CCVersion))
+	upstream.Header.Set("User-Agent", "claude-cli/"+CCVersion+" (external, sdk-cli)")
+	return nil
 }
 
 func transformBetaHeaders(req *http.Request) {
@@ -49,7 +56,8 @@ func transformBetaHeaders(req *http.Request) {
 	}
 
 	// Strip unwanted betas
-	filtered := make([]string, 0, len(betas))
+	filtered := make([]string, 0, len(betas)+len(RequiredBetas))
+	filtered = append(filtered, RequiredBetas...)
 	for _, b := range betas {
 		b = strings.TrimSpace(b)
 		if b == "" {
@@ -62,26 +70,21 @@ func transformBetaHeaders(req *http.Request) {
 				break
 			}
 		}
-		if !strip {
+		if !strip && !containsBetaValue(filtered, b) {
 			filtered = append(filtered, b)
 		}
 	}
 
-	// Add required betas (dedup)
-	for _, req := range RequiredBetas {
-		found := false
-		for _, b := range filtered {
-			if b == req {
-				found = true
-				break
-			}
-		}
-		if !found {
-			filtered = append(filtered, req)
+	req.Header.Set("anthropic-beta", strings.Join(filtered, ","))
+}
+
+func containsBetaValue(betas []string, value string) bool {
+	for _, beta := range betas {
+		if beta == value {
+			return true
 		}
 	}
-
-	req.Header.Set("anthropic-beta", strings.Join(filtered, ","))
+	return false
 }
 
 // TransformRequestBody applies tool name substitution and system prompt conversion.
@@ -90,6 +93,13 @@ func TransformRequestBody(body []byte) []byte {
 	if err := json.Unmarshal(body, &msg); err != nil {
 		log.Printf("[transform] failed to parse request body, forwarding as-is: %v", err)
 		return body
+	}
+
+	// Cap max_tokens so the OAuth subscription's per-minute bucket isn't
+	// blown out by a single oversized request.
+	if mt, ok := msg["max_tokens"].(float64); ok && mt > float64(MaxTokensCap) {
+		log.Printf("[transform] max_tokens %.0f -> %d (capped for OAuth)", mt, MaxTokensCap)
+		msg["max_tokens"] = float64(MaxTokensCap)
 	}
 
 	// Tool name substitution in tools array
@@ -114,8 +124,11 @@ func TransformRequestBody(body []byte) []byte {
 		}
 	}
 
-	// System prompt XML -> Markdown conversion
-	transformSystemPrompt(msg)
+	if msg["model"] == "claude-opus-5-5" {
+		addNativeSystemBlocks(msg)
+	} else {
+		transformSystemPrompt(msg)
+	}
 
 	result, err := json.Marshal(msg)
 	if err != nil {

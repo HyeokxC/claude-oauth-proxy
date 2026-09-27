@@ -118,6 +118,7 @@ func (p *ProxyHandler) doUpstreamRequest(r *http.Request, token string) (*http.R
 	isMessages := strings.Contains(r.URL.Path, "/messages")
 	if isMessages && len(body) > 0 {
 		body = TransformRequestBody(body)
+		LogSentBodySummary(body)
 	}
 
 	// Build upstream URL
@@ -132,7 +133,9 @@ func (p *ProxyHandler) doUpstreamRequest(r *http.Request, token string) (*http.R
 	}
 
 	// Transform headers
-	TransformRequestHeaders(upstream, r, token)
+	if err := TransformRequestHeaders(upstream, r, token); err != nil {
+		return nil, err
+	}
 	upstream.ContentLength = int64(len(body))
 
 	log.Printf("[proxy] %s %s -> %s (body: %d bytes)", r.Method, r.URL.Path, upstreamURL, len(body))
