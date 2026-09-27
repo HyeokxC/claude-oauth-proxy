@@ -3,16 +3,46 @@ package main
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+// RateLimitCooldown is how long the proxy short-circuits incoming requests
+// after upstream returns 429. Anthropic's per-minute bucket needs a quiet
+// window to refill; without this, opencode's retry loop keeps the bucket
+// pinned at zero and 429s never clear.
+const RateLimitCooldown = 15 * time.Second
 
 type ProxyHandler struct {
 	tokenMgr   *TokenManager
 	httpClient *http.Client
+
+	cooldownMu    sync.Mutex
+	cooldownUntil time.Time
+}
+
+func (p *ProxyHandler) inCooldown() time.Duration {
+	p.cooldownMu.Lock()
+	defer p.cooldownMu.Unlock()
+	if d := time.Until(p.cooldownUntil); d > 0 {
+		return d
+	}
+	return 0
+}
+
+func (p *ProxyHandler) startCooldown(d time.Duration) {
+	p.cooldownMu.Lock()
+	defer p.cooldownMu.Unlock()
+	until := time.Now().Add(d)
+	if until.After(p.cooldownUntil) {
+		p.cooldownUntil = until
+	}
 }
 
 func NewProxyHandler(tokenMgr *TokenManager) *ProxyHandler {
@@ -42,17 +72,30 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Short-circuit while we're cooling down from a recent upstream 429.
+	// Returning a synthetic 429 with Retry-After is the cleanest signal
+	// to clients (and stops their retry storm from holding the bucket open).
+	if remaining := p.inCooldown(); remaining > 0 {
+		retryAfter := int(remaining.Seconds()) + 1
+		log.Printf("[proxy] cooldown active, short-circuiting 429 (retry in %ds)", retryAfter)
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"proxy cooldown active, slow down"}}`))
+		return
+	}
+
 	token, err := p.tokenMgr.GetValidToken()
 	if err != nil {
-		log.Printf("[proxy] token error: %v", err)
-		http.Error(w, `{"error":"proxy token error: `+err.Error()+`"}`, http.StatusServiceUnavailable)
+		log.Printf("[proxy] credential unavailable")
+		http.Error(w, `{"error":"proxy credential unavailable"}`, http.StatusServiceUnavailable)
 		return
 	}
 
 	resp, err := p.doUpstreamRequest(r, token)
 	if err != nil {
-		log.Printf("[proxy] upstream error: %v", err)
-		http.Error(w, `{"error":"upstream request failed: `+err.Error()+`"}`, http.StatusBadGateway)
+		log.Printf("[proxy] upstream transport failed")
+		http.Error(w, `{"error":"upstream request failed"}`, http.StatusBadGateway)
 		return
 	}
 
@@ -61,27 +104,59 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		resp.Body.Close()
 		log.Printf("[proxy] got 401, refreshing token and retrying...")
 		if err := p.tokenMgr.ForceRefresh(); err != nil {
-			log.Printf("[proxy] force refresh failed: %v", err)
+			log.Printf("[proxy] force refresh failed")
 			http.Error(w, `{"error":"token refresh failed"}`, http.StatusServiceUnavailable)
 			return
 		}
-		token, _ = p.tokenMgr.GetValidToken()
+		token, err = p.tokenMgr.GetValidToken()
+		if err != nil {
+			log.Printf("[proxy] credential unavailable after refresh")
+			http.Error(w, `{"error":"proxy credential unavailable"}`, http.StatusServiceUnavailable)
+			return
+		}
 		resp, err = p.doUpstreamRequest(r, token)
 		if err != nil {
-			log.Printf("[proxy] retry upstream error: %v", err)
+			log.Printf("[proxy] retry upstream transport failed")
 			http.Error(w, `{"error":"upstream retry failed"}`, http.StatusBadGateway)
 			return
 		}
 	}
 
-	log.Printf("[proxy] upstream responded: %d %s (content-type: %s)",
-		resp.StatusCode, resp.Status, resp.Header.Get("Content-Type"))
+	log.Printf("[proxy] upstream responded: status=%d request_id=%q content_type=%q",
+		resp.StatusCode, resp.Header.Get("Request-Id"), resp.Header.Get("Content-Type"))
 
-	// Log error response bodies for debugging
+	// Error payloads can contain user content; forward them without logging their text.
 	if resp.StatusCode >= 400 {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		log.Printf("[proxy] error response body: %s", string(bodyBytes))
+		var failure struct {
+			Error struct {
+				Type string `json:"type"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(bodyBytes, &failure) == nil {
+			switch failure.Error.Type {
+			case "rate_limit_error", "authentication_error", "permission_error", "invalid_request_error", "overloaded_error", "api_error":
+				log.Printf("[proxy] upstream error type=%s status=%d", failure.Error.Type, resp.StatusCode)
+			}
+		}
+		LogRateLimitHeaders(resp)
+
+		// On 429, start a cooldown so the per-minute bucket can refill.
+		// Honor upstream Retry-After if it's longer than our default.
+		if resp.StatusCode == http.StatusTooManyRequests {
+			cd := RateLimitCooldown
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				if secs, err := strconv.Atoi(strings.TrimSpace(ra)); err == nil && secs > 0 {
+					if d := time.Duration(secs) * time.Second; d > cd {
+						cd = d
+					}
+				}
+			}
+			p.startCooldown(cd)
+			log.Printf("[proxy] entering cooldown for %s after upstream 429", cd)
+		}
+
 		// Still forward the error to the client
 		CopyResponseHeaders(w, resp)
 		w.Write(bodyBytes)
@@ -138,18 +213,22 @@ func (p *ProxyHandler) doUpstreamRequest(r *http.Request, token string) (*http.R
 	}
 	upstream.ContentLength = int64(len(body))
 
-	log.Printf("[proxy] %s %s -> %s (body: %d bytes)", r.Method, r.URL.Path, upstreamURL, len(body))
-
-	// Debug: log outgoing headers
-	for k, vv := range upstream.Header {
-		if strings.EqualFold(k, "Authorization") {
-			log.Printf("[proxy]   >> %s: Bearer %s...%s", k, vv[0][7:17], vv[0][len(vv[0])-4:])
-		} else {
-			log.Printf("[proxy]   >> %s: %s", k, strings.Join(vv, ", "))
-		}
-	}
+	log.Printf("[proxy] %s %s (body: %d bytes)", r.Method, r.URL.Path, len(body))
 
 	return p.httpClient.Do(upstream)
+}
+
+// LogRateLimitHeaders prints any anthropic/x-ratelimit/retry-after headers from
+// the upstream response so we can see why the request was rejected.
+func LogRateLimitHeaders(resp *http.Response) {
+	for k, vv := range resp.Header {
+		lk := strings.ToLower(k)
+		if lk == "retry-after" ||
+			strings.HasPrefix(lk, "anthropic-ratelimit-") ||
+			strings.HasPrefix(lk, "x-ratelimit-") {
+			log.Printf("[proxy]   << %s: %s", k, strings.Join(vv, ", "))
+		}
+	}
 }
 
 func (p *ProxyHandler) handleHealth(w http.ResponseWriter) {
