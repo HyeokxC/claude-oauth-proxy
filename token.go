@@ -6,10 +6,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 )
@@ -21,10 +17,10 @@ type Credentials struct {
 }
 
 type TokenManager struct {
-	mu          sync.RWMutex
-	creds       *Credentials
-	refreshing  sync.Mutex
-	httpClient  *http.Client
+	mu         sync.RWMutex
+	creds      *Credentials
+	refreshing sync.Mutex
+	httpClient *http.Client
 }
 
 func NewTokenManager() *TokenManager {
@@ -89,31 +85,6 @@ func (tm *TokenManager) loadCredentials() error {
 	tm.mu.Unlock()
 	log.Printf("[token] loaded from file (expires: %s)", time.UnixMilli(creds.ExpiresAt).Format(time.RFC3339))
 	return nil
-}
-
-func (tm *TokenManager) readFromKeychain() (*Credentials, error) {
-	cmd := exec.Command("security", "find-generic-password", "-s", KeychainService, "-w")
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("security command: %w", err)
-	}
-
-	raw := strings.TrimSpace(string(out))
-	return parseCredentials([]byte(raw))
-}
-
-func (tm *TokenManager) readFromFile() (*Credentials, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, err
-	}
-
-	data, err := os.ReadFile(filepath.Join(home, ".claude", ".credentials.json"))
-	if err != nil {
-		return nil, err
-	}
-
-	return parseCredentials(data)
 }
 
 // parseCredentials handles both nested {"claudeAiOauth": {...}} and flat formats.
