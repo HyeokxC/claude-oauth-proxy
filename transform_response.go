@@ -25,6 +25,11 @@ func StreamTransformResponse(w http.ResponseWriter, body io.ReadCloser) {
 	scanner := bufio.NewScanner(body)
 	// Increase buffer for large SSE events
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var summary struct {
+		messageStart, contentStart, contentDelta, messageDelta, messageStop, errors int
+		inputTokens, outputTokens, malformed                                        int
+		stopReason, errorType                                                       string
+	}
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -32,6 +37,56 @@ func StreamTransformResponse(w http.ResponseWriter, body io.ReadCloser) {
 		if strings.HasPrefix(line, "data: ") {
 			data := line[6:]
 			if data != "[DONE]" {
+				var event struct {
+					Type  string `json:"type"`
+					Delta struct {
+						StopReason string `json:"stop_reason"`
+					} `json:"delta"`
+					Error struct {
+						Type string `json:"type"`
+					} `json:"error"`
+					Usage struct {
+						OutputTokens int `json:"output_tokens"`
+					} `json:"usage"`
+					Message struct {
+						Usage struct {
+							InputTokens int `json:"input_tokens"`
+						} `json:"usage"`
+					} `json:"message"`
+				}
+				if json.Unmarshal([]byte(data), &event) == nil {
+					switch event.Type {
+					case "message_start":
+						summary.messageStart++
+						summary.inputTokens = event.Message.Usage.InputTokens
+					case "content_block_start":
+						summary.contentStart++
+					case "content_block_delta":
+						summary.contentDelta++
+					case "message_delta":
+						summary.messageDelta++
+						summary.outputTokens = event.Usage.OutputTokens
+						switch event.Delta.StopReason {
+						case "end_turn", "max_tokens", "stop_sequence", "tool_use", "refusal", "content_filter":
+							summary.stopReason = event.Delta.StopReason
+						case "":
+						default:
+							summary.stopReason = "other"
+						}
+					case "message_stop":
+						summary.messageStop++
+					case "error":
+						summary.errors++
+						switch event.Error.Type {
+						case "rate_limit_error", "authentication_error", "permission_error", "invalid_request_error", "overloaded_error", "api_error", "content_filter":
+							summary.errorType = event.Error.Type
+						default:
+							summary.errorType = "other"
+						}
+					}
+				} else {
+					summary.malformed++
+				}
 				transformed := reverseToolNamesInSSEData([]byte(data))
 				w.Write([]byte("data: "))
 				w.Write(transformed)
@@ -50,6 +105,8 @@ func StreamTransformResponse(w http.ResponseWriter, body io.ReadCloser) {
 	if err := scanner.Err(); err != nil {
 		log.Printf("[response] SSE scan error: %v", err)
 	}
+	log.Printf("[response] SSE summary: message_start=%d content_block_start=%d content_block_delta=%d message_delta=%d message_stop=%d error=%d malformed=%d stop_reason=%s error_type=%s input_tokens=%d output_tokens=%d",
+		summary.messageStart, summary.contentStart, summary.contentDelta, summary.messageDelta, summary.messageStop, summary.errors, summary.malformed, summary.stopReason, summary.errorType, summary.inputTokens, summary.outputTokens)
 }
 
 // TransformResponseBody reverses tool names in a non-streaming JSON response.
