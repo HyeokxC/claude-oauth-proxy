@@ -36,6 +36,9 @@ type TokenManager struct {
 	creds      *Credentials
 	refreshing sync.Mutex
 	httpClient *http.Client
+	// Protected by refreshing; the CLI-owned source is read, never overwritten.
+	sourceReader func() (*Credentials, error)
+	sourceCreds  Credentials
 }
 
 func NewTokenManager() *TokenManager {
@@ -51,7 +54,16 @@ func (tm *TokenManager) GetValidToken() (string, error) {
 	tm.mu.RUnlock()
 
 	if creds == nil {
-		if err := tm.loadCredentials(); err != nil {
+		tm.refreshing.Lock()
+		tm.mu.RLock()
+		loaded := tm.creds != nil
+		tm.mu.RUnlock()
+		var err error
+		if !loaded {
+			err = tm.loadCredentials()
+		}
+		tm.refreshing.Unlock()
+		if err != nil {
 			return "", fmt.Errorf("load credentials: %w", err)
 		}
 		tm.mu.RLock()
@@ -61,7 +73,7 @@ func (tm *TokenManager) GetValidToken() (string, error) {
 
 	// Refresh if within 5 minutes of expiry
 	if time.Now().UnixMilli() >= creds.ExpiresAt-5*60*1000 {
-		if err := tm.refresh(); err != nil {
+		if err := tm.refresh(""); err != nil {
 			return "", fmt.Errorf("refresh token: %w", err)
 		}
 		tm.mu.RLock()
@@ -74,13 +86,26 @@ func (tm *TokenManager) GetValidToken() (string, error) {
 
 // ForceRefresh forces a token refresh (e.g., after a 401).
 func (tm *TokenManager) ForceRefresh() error {
-	return tm.refresh()
+	tm.mu.RLock()
+	rejected := ""
+	if tm.creds != nil {
+		rejected = tm.creds.AccessToken
+	}
+	tm.mu.RUnlock()
+	return tm.RefreshAfterUnauthorized(rejected)
+}
+
+// RefreshAfterUnauthorized deduplicates concurrent 401s for the same access token.
+func (tm *TokenManager) RefreshAfterUnauthorized(rejected string) error {
+	return tm.refresh(rejected)
 }
 
 func (tm *TokenManager) loadCredentials() error {
 	// Try macOS Keychain first
 	creds, err := tm.readFromKeychain()
 	if err == nil && creds != nil {
+		tm.sourceReader = tm.readFromKeychain
+		tm.sourceCreds = *creds
 		tm.mu.Lock()
 		tm.creds = creds
 		tm.mu.Unlock()
@@ -95,6 +120,8 @@ func (tm *TokenManager) loadCredentials() error {
 		return fmt.Errorf("no credentials found: keychain and file both failed: %w", err)
 	}
 
+	tm.sourceReader = tm.readFromFile
+	tm.sourceCreds = *creds
 	tm.mu.Lock()
 	tm.creds = creds
 	tm.mu.Unlock()
@@ -123,17 +150,23 @@ func parseCredentials(data []byte) (*Credentials, error) {
 	return &creds, nil
 }
 
-func (tm *TokenManager) refresh() error {
+func (tm *TokenManager) refresh(rejected string) error {
 	// Prevent thundering herd: only one goroutine refreshes at a time
 	tm.refreshing.Lock()
 	defer tm.refreshing.Unlock()
 
 	// Double-check: another goroutine may have already refreshed
 	tm.mu.RLock()
-	if tm.creds != nil && time.Now().UnixMilli() < tm.creds.ExpiresAt-5*60*1000 {
+	if tm.creds != nil && time.Now().UnixMilli() < tm.creds.ExpiresAt-5*60*1000 &&
+		(rejected == "" || tm.creds.AccessToken != rejected) {
 		tm.mu.RUnlock()
 		return nil
 	}
+	tm.mu.RUnlock()
+	if tm.reloadChangedCredentials(rejected) {
+		return nil
+	}
+	tm.mu.RLock()
 	refreshToken := ""
 	if tm.creds != nil {
 		refreshToken = tm.creds.RefreshToken
@@ -141,13 +174,7 @@ func (tm *TokenManager) refresh() error {
 	tm.mu.RUnlock()
 
 	if refreshToken == "" {
-		// Reload from source to get refresh token
-		if err := tm.loadCredentials(); err != nil {
-			return err
-		}
-		tm.mu.RLock()
-		refreshToken = tm.creds.RefreshToken
-		tm.mu.RUnlock()
+		return fmt.Errorf("no refresh token available; run claude auth login --claudeai")
 	}
 
 	log.Printf("[token] refreshing OAuth token...")
@@ -160,11 +187,14 @@ func (tm *TokenManager) refresh() error {
 
 	resp, err := tm.httpClient.PostForm(TokenRefreshURL, formData)
 	if err != nil {
-		return fmt.Errorf("refresh request: %w", err)
+		return fmt.Errorf("refresh request failed")
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		if tm.reloadChangedCredentials(rejected) {
+			return nil
+		}
 		return fmt.Errorf("refresh failed with status %d", resp.StatusCode)
 	}
 
@@ -174,7 +204,13 @@ func (tm *TokenManager) refresh() error {
 		ExpiresIn    int64  `json:"expires_in"` // seconds
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("parse refresh response: %w", err)
+		return fmt.Errorf("invalid refresh response")
+	}
+	if result.AccessToken == "" || result.ExpiresIn <= 0 || result.ExpiresIn > 365*24*60*60 {
+		return fmt.Errorf("invalid refresh credential or expiry")
+	}
+	if tm.reloadChangedCredentials(rejected) {
+		return nil
 	}
 
 	newCreds := &Credentials{
