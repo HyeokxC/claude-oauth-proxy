@@ -2,3 +2,4 @@ cc-proxy
 *.exe
 .DS_Store
 .omc/
+cc-proxy.log
