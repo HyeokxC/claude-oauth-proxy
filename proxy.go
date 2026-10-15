@@ -103,7 +103,7 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if resp.StatusCode == http.StatusUnauthorized {
 		resp.Body.Close()
 		log.Printf("[proxy] got 401, refreshing token and retrying...")
-		if err := p.tokenMgr.ForceRefresh(); err != nil {
+		if err := p.tokenMgr.RefreshAfterUnauthorized(token); err != nil {
 			log.Printf("[proxy] force refresh failed")
 			http.Error(w, `{"error":"token refresh failed"}`, http.StatusServiceUnavailable)
 			return
@@ -188,6 +188,11 @@ func (p *ProxyHandler) doUpstreamRequest(r *http.Request, token string) (*http.R
 	if err != nil {
 		return nil, err
 	}
+	// Keep the original payload available for the single authentication retry.
+	if err := r.Body.Close(); err != nil {
+		return nil, err
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
 
 	// Transform body for /messages endpoints
 	isMessages := strings.Contains(r.URL.Path, "/messages")
