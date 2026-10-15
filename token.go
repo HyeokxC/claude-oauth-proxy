@@ -16,6 +16,21 @@ type Credentials struct {
 	ExpiresAt    int64  `json:"expiresAt"` // milliseconds since epoch
 }
 
+func (c *Credentials) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		AccessToken  string  `json:"accessToken"`
+		RefreshToken string  `json:"refreshToken"`
+		ExpiresAt    float64 `json:"expiresAt"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	c.AccessToken = wire.AccessToken
+	c.RefreshToken = wire.RefreshToken
+	c.ExpiresAt = int64(wire.ExpiresAt)
+	return nil
+}
+
 type TokenManager struct {
 	mu         sync.RWMutex
 	creds      *Credentials

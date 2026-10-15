@@ -139,6 +139,19 @@ func TestParseCredentials_acceptsNestedAndFlat(t *testing.T) {
 	}
 }
 
+func TestParseCredentials_acceptsFractionalExpiryMilliseconds(t *testing.T) {
+	input := `{"claudeAiOauth":{"accessToken":"synthetic-access","refreshToken":"synthetic-refresh","expiresAt":4102444800000.75}}`
+
+	creds, err := parseCredentials([]byte(input))
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if creds.AccessToken != "synthetic-access" || creds.ExpiresAt != 4102444800000 {
+		t.Fatalf("fractional expiry parse mismatch: token=%q expiresAt=%d", creds.AccessToken, creds.ExpiresAt)
+	}
+}
+
 func TestKeychainAccount_fallsBackForUnsafeUsername(t *testing.T) {
 	for _, name := range []string{"", "name with spaces", "name/with/slash", "nonascii-한글"} {
 		// Given: a username outside Claude Code's safe account character set.
