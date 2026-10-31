@@ -33,6 +33,10 @@ OpenCode -> cc-proxy (127.0.0.1:34156) -> api.anthropic.com
 - `/messages`의 `max_tokens`는 `16384`으로 제한합니다.
 - upstream이 429를 반환하면 기본 15초 동안 새 요청을 잠시 중단합니다. upstream의 더 긴 `Retry-After` 값은 따릅니다.
 
+### 벤치마크 단일 시도 모드
+
+`X-CC-Proxy-Mode: benchmark-single-attempt-v1`을 보내면 프록시는 같은 응답 헤더로 지원 여부를 알리고, upstream 401에서 명시적 토큰 갱신 및 재시도를 하지 않습니다. `/health`에도 응답 헤더가 붙지만 기존 상태 코드와 JSON은 그대로이며, 이 헤더는 자격증명 상태나 추론 성공을 보증하지 않습니다. 알 수 없는 비어 있지 않은 모드 값은 upstream/자격증명 접근 전에 거부합니다. 내부 모드 헤더는 upstream에 전달되지 않고, 이 모드에서는 POST 재전송 표식이 되지 않도록 `Idempotency-Key`와 `X-Idempotency-Key`도 제거합니다. 헤더를 보내지 않은 일반 요청의 401 재시도와 본문 변환은 그대로입니다.
+
 Opus 5.5 동작은 OpenCode를 통한 검증을 기준으로 합니다. OpenCode의 자동 제목 생성 요청은 다른 모델을 사용할 수 있으며, 제목 생성 실패나 거부 응답은 본문 요청과 별개의 동작입니다. 비대화형 검증에서는 지원되는 경우 명시적인 제목 요청을 사용하세요.
 
 ## 요구사항
