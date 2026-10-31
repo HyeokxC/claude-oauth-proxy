@@ -19,6 +19,9 @@ import (
 // pinned at zero and 429s never clear.
 const RateLimitCooldown = 15 * time.Second
 
+const benchmarkMode = "benchmark-single-attempt-v1"
+const benchmarkModeHeader = "X-CC-Proxy-Mode"
+
 type ProxyHandler struct {
 	tokenMgr   *TokenManager
 	httpClient *http.Client
@@ -66,6 +69,16 @@ func NewProxyHandler(tokenMgr *TokenManager) *ProxyHandler {
 }
 
 func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	modeValues := r.Header.Values(benchmarkModeHeader)
+	mode := r.Header.Get(benchmarkModeHeader)
+	if len(modeValues) > 1 || (mode != "" && mode != benchmarkMode) {
+		http.Error(w, `{"error":"unknown proxy mode"}`, http.StatusBadRequest)
+		return
+	}
+	if mode == benchmarkMode {
+		w.Header().Set(benchmarkModeHeader, benchmarkMode)
+	}
+
 	// Health check
 	if r.URL.Path == "/health" {
 		p.handleHealth(w)
@@ -100,7 +113,7 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Retry once on 401 with refreshed token
-	if resp.StatusCode == http.StatusUnauthorized {
+	if resp.StatusCode == http.StatusUnauthorized && mode != benchmarkMode {
 		resp.Body.Close()
 		log.Printf("[proxy] got 401, refreshing token and retrying...")
 		if err := p.tokenMgr.ForceRefresh(); err != nil {
@@ -120,6 +133,9 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"upstream retry failed"}`, http.StatusBadGateway)
 			return
 		}
+	}
+	if mode == benchmarkMode {
+		resp.Header.Del(benchmarkModeHeader)
 	}
 
 	log.Printf("[proxy] upstream responded: status=%d request_id=%q content_type=%q",
