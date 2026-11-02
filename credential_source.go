@@ -2,6 +2,8 @@ package main
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -66,7 +68,18 @@ func readKeychainData(service, account string) ([]byte, error) {
 	if err != nil {
 		return nil, errors.New("keychain lookup failed")
 	}
-	return []byte(strings.TrimSpace(string(out))), nil
+	if len(out) > 2*maxCredentialDocument+1 {
+		return nil, errCredentialDocument
+	}
+	data := []byte(strings.TrimSuffix(string(out), "\n"))
+	if !json.Valid(data) {
+		decoded, err := hex.DecodeString(string(data))
+		if err != nil {
+			return nil, errCredentialDocument
+		}
+		data = decoded
+	}
+	return data, nil
 }
 
 func (tm *TokenManager) readFromKeychain() (*Credentials, error) {
