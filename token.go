@@ -2,10 +2,8 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
-	"log"
+	"errors"
 	"net/http"
-	"net/url"
 	"sync"
 	"time"
 )
@@ -31,165 +29,182 @@ func (c *Credentials) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+const refreshFailureCooldown = 30 * time.Second
+
+var ErrCredentialPersistence = errors.New("refreshed credentials could not be persisted")
+
+type refreshFailure struct {
+	revision Credentials
+	until    time.Time
+	err      error
+}
+
+type pendingCredentials struct {
+	base *credentialRecord
+	next Credentials
+}
+
 type TokenManager struct {
-	mu         sync.RWMutex
+	// All lifecycle transitions, including I/O, are serialized by mu.
+	mu         sync.Mutex
 	creds      *Credentials
-	refreshing sync.Mutex
 	httpClient *http.Client
+	store      credentialStore
+	now        func() time.Time
+	source     *credentialRecord
+	pending    *pendingCredentials
+	failures   [2]refreshFailure
+	rejected   string
 }
 
 func NewTokenManager() *TokenManager {
 	return &TokenManager{
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		httpClient: &http.Client{Timeout: 30 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
+		store: &sourceCredentialStore{nativeWrite: nativeKeychainUpdate},
+		now:   time.Now,
 	}
 }
 
-// GetValidToken returns a valid access token, refreshing if necessary.
-func (tm *TokenManager) GetValidToken() (string, error) {
-	tm.mu.RLock()
-	creds := tm.creds
-	tm.mu.RUnlock()
+func (tm *TokenManager) GetValidToken() (string, error) { return tm.token(false, "") }
 
-	if creds == nil {
-		if err := tm.loadCredentials(); err != nil {
-			return "", fmt.Errorf("load credentials: %w", err)
-		}
-		tm.mu.RLock()
-		creds = tm.creds
-		tm.mu.RUnlock()
-	}
-
-	// Refresh if within 5 minutes of expiry
-	if time.Now().UnixMilli() >= creds.ExpiresAt-5*60*1000 {
-		if err := tm.refresh(); err != nil {
-			return "", fmt.Errorf("refresh token: %w", err)
-		}
-		tm.mu.RLock()
-		creds = tm.creds
-		tm.mu.RUnlock()
-	}
-
-	return creds.AccessToken, nil
-}
-
-// ForceRefresh forces a token refresh (e.g., after a 401).
+// ForceRefresh also refreshes an unexpired token. Use the token-aware method
+// when handling 401s so concurrent rejections of one token share a rotation.
 func (tm *TokenManager) ForceRefresh() error {
-	return tm.refresh()
+	_, err := tm.token(true, "")
+	return err
 }
 
-func (tm *TokenManager) loadCredentials() error {
-	// Try macOS Keychain first
-	creds, err := tm.readFromKeychain()
-	if err == nil && creds != nil {
-		tm.mu.Lock()
-		tm.creds = creds
-		tm.mu.Unlock()
-		log.Printf("[token] loaded from keychain (expires: %s)", time.UnixMilli(creds.ExpiresAt).Format(time.RFC3339))
-		return nil
-	}
-	log.Printf("[token] keychain read failed: %v, trying file fallback", err)
+func (tm *TokenManager) ForceRefreshRejected(rejected string) error {
+	_, err := tm.token(false, rejected)
+	return err
+}
 
-	// Fallback to file
-	creds, err = tm.readFromFile()
-	if err != nil {
-		return fmt.Errorf("no credentials found: keychain and file both failed: %w", err)
-	}
+func (tm *TokenManager) adopt(record *credentialRecord) {
+	tm.source = record
+	creds := record.auth
+	tm.creds = &creds
+}
 
+func (tm *TokenManager) needsRefresh() bool {
+	return tm.creds.AccessToken == tm.rejected || tm.now().UnixMilli() >= tm.creds.ExpiresAt-5*60*1000
+}
+
+func (tm *TokenManager) rememberFailure(revision Credentials, err error) {
+	tm.failures[1] = tm.failures[0]
+	tm.failures[0] = refreshFailure{revision, tm.now().Add(refreshFailureCooldown), err}
+}
+
+func (tm *TokenManager) token(force bool, rejected string) (string, error) {
 	tm.mu.Lock()
-	tm.creds = creds
-	tm.mu.Unlock()
-	log.Printf("[token] loaded from file (expires: %s)", time.UnixMilli(creds.ExpiresAt).Format(time.RFC3339))
+	defer tm.mu.Unlock()
+	pendingBefore := tm.pending
+	cachedAccess := ""
+	if tm.creds != nil {
+		cachedAccess = tm.creds.AccessToken
+		// Remember a rejection even if locking or reading the source fails.
+		// A late 401 for an older token must not clear a newer rejection.
+		if rejected == cachedAccess || force && pendingBefore == nil {
+			tm.rejected = cachedAccess
+		}
+	}
+	unlock, err := tm.store.Lock()
+	if err != nil {
+		if pendingBefore != nil {
+			return "", ErrCredentialPersistence
+		}
+		return "", errors.New("credential store unavailable")
+	}
+	defer unlock()
+	if err := tm.reload(); err != nil {
+		return "", err
+	}
+	if rejected != "" && tm.creds.AccessToken == rejected || force && pendingBefore == nil && cachedAccess == "" {
+		tm.rejected = tm.creds.AccessToken
+	}
+	if pendingBefore != nil && *tm.creds == pendingBefore.next && tm.creds.AccessToken != tm.rejected && tm.now().UnixMilli() < tm.creds.ExpiresAt {
+		return tm.creds.AccessToken, nil
+	}
+	// At most two refresh attempts, and never twice for the same auth revision.
+	var attempted [2]Credentials
+	for attempt := 0; attempt < len(attempted); attempt++ {
+		if !tm.needsRefresh() {
+			return tm.creds.AccessToken, nil
+		}
+		revision := *tm.creds
+		if attempt > 0 && revision == attempted[0] {
+			break
+		}
+		for _, failure := range tm.failures {
+			if failure.revision == revision && tm.now().Before(failure.until) {
+				return "", failure.err
+			}
+		}
+		attempted[attempt] = revision
+		next, refreshErr := tm.requestRefresh(revision)
+		if refreshErr == nil {
+			if next.AccessToken == tm.rejected {
+				tm.rememberFailure(next, errors.New("refreshed token was already rejected"))
+			}
+			tm.pending = &pendingCredentials{base: tm.source, next: next}
+			if err := tm.savePending(); err != nil {
+				return "", err
+			}
+			if tm.creds.AccessToken == tm.rejected {
+				return "", errors.New("refreshed token was already rejected")
+			}
+			if *tm.creds == next || !tm.needsRefresh() {
+				return tm.creds.AccessToken, nil
+			}
+			continue
+		}
+		tm.rememberFailure(revision, refreshErr)
+		if err := tm.reload(); err != nil || *tm.creds == revision {
+			return "", refreshErr
+		}
+		if !tm.needsRefresh() {
+			return tm.creds.AccessToken, nil
+		}
+	}
+	return "", errors.New("credential recovery exhausted")
+}
+
+func (tm *TokenManager) reload() error {
+	record, err := tm.store.Load(tm.source)
+	if tm.pending != nil {
+		if err == nil && record.auth != tm.pending.base.auth {
+			if record.auth == tm.pending.next && sameCredentialSource(record, tm.pending.base) {
+				return tm.savePending() // finish a prior rename's directory sync
+			}
+			// A new login (or a completed write) supersedes pending rotation.
+			tm.pending = nil
+			tm.adopt(record)
+			return nil
+		}
+		return tm.savePending()
+	}
+	if err != nil {
+		return errors.New("credential source unavailable")
+	}
+	tm.adopt(record)
 	return nil
 }
 
-// parseCredentials handles both nested {"claudeAiOauth": {...}} and flat formats.
-func parseCredentials(data []byte) (*Credentials, error) {
-	// Try nested format first
-	var nested struct {
-		ClaudeAiOauth Credentials `json:"claudeAiOauth"`
-	}
-	if err := json.Unmarshal(data, &nested); err == nil && nested.ClaudeAiOauth.AccessToken != "" {
-		return &nested.ClaudeAiOauth, nil
-	}
-
-	// Try flat format
-	var creds Credentials
-	if err := json.Unmarshal(data, &creds); err != nil {
-		return nil, fmt.Errorf("parse credentials: %w", err)
-	}
-	if creds.AccessToken == "" {
-		return nil, fmt.Errorf("no access token in credentials")
-	}
-	return &creds, nil
-}
-
-func (tm *TokenManager) refresh() error {
-	// Prevent thundering herd: only one goroutine refreshes at a time
-	tm.refreshing.Lock()
-	defer tm.refreshing.Unlock()
-
-	// Double-check: another goroutine may have already refreshed
-	tm.mu.RLock()
-	if tm.creds != nil && time.Now().UnixMilli() < tm.creds.ExpiresAt-5*60*1000 {
-		tm.mu.RUnlock()
+func (tm *TokenManager) savePending() error {
+	pending := tm.pending
+	// Keep the rotated credentials in memory even when the write fails.
+	next := pending.next
+	tm.creds = &next
+	record, err := tm.store.Save(pending.base, next)
+	if errors.Is(err, errSourceChanged) && record != nil && record.auth != pending.base.auth {
+		tm.pending = nil
+		tm.adopt(record)
 		return nil
 	}
-	refreshToken := ""
-	if tm.creds != nil {
-		refreshToken = tm.creds.RefreshToken
-	}
-	tm.mu.RUnlock()
-
-	if refreshToken == "" {
-		// Reload from source to get refresh token
-		if err := tm.loadCredentials(); err != nil {
-			return err
-		}
-		tm.mu.RLock()
-		refreshToken = tm.creds.RefreshToken
-		tm.mu.RUnlock()
-	}
-
-	log.Printf("[token] refreshing OAuth token...")
-
-	formData := url.Values{
-		"grant_type":    {"refresh_token"},
-		"refresh_token": {refreshToken},
-		"client_id":     {OAuthClientID},
-	}
-
-	resp, err := tm.httpClient.PostForm(TokenRefreshURL, formData)
 	if err != nil {
-		return fmt.Errorf("refresh request: %w", err)
+		return ErrCredentialPersistence
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("refresh failed with status %d", resp.StatusCode)
-	}
-
-	var result struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		ExpiresIn    int64  `json:"expires_in"` // seconds
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("parse refresh response: %w", err)
-	}
-
-	newCreds := &Credentials{
-		AccessToken:  result.AccessToken,
-		RefreshToken: result.RefreshToken,
-		ExpiresAt:    time.Now().UnixMilli() + result.ExpiresIn*1000,
-	}
-	if newCreds.RefreshToken == "" {
-		newCreds.RefreshToken = refreshToken // keep old if not returned
-	}
-
-	tm.mu.Lock()
-	tm.creds = newCreds
-	tm.mu.Unlock()
-
-	log.Printf("[token] refreshed successfully (expires: %s)", time.UnixMilli(newCreds.ExpiresAt).Format(time.RFC3339))
+	tm.pending = nil
+	tm.adopt(record)
 	return nil
 }

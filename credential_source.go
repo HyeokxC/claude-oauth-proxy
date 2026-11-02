@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/user"
@@ -43,10 +44,10 @@ func keychainAccount(username string) string {
 	return username
 }
 
-func (tm *TokenManager) readFromKeychain() (*Credentials, error) {
+func keychainIdentity() (string, string, error) {
 	configDir, defaultDir, err := effectiveConfigDir()
 	if err != nil {
-		return nil, err
+		return "", "", err
 	}
 	service := KeychainService
 	if configDir != defaultDir {
@@ -57,11 +58,27 @@ func (tm *TokenManager) readFromKeychain() (*Credentials, error) {
 	if current, err := user.Current(); err == nil {
 		account = keychainAccount(current.Username)
 	}
+	return service, account, nil
+}
+
+func readKeychainData(service, account string) ([]byte, error) {
 	out, err := exec.Command("security", "find-generic-password", "-s", service, "-a", account, "-w").Output()
 	if err != nil {
 		return nil, errors.New("keychain lookup failed")
 	}
-	return parseCredentials([]byte(strings.TrimSpace(string(out))))
+	return []byte(strings.TrimSpace(string(out))), nil
+}
+
+func (tm *TokenManager) readFromKeychain() (*Credentials, error) {
+	service, account, err := keychainIdentity()
+	if err != nil {
+		return nil, errors.New("keychain identity unavailable")
+	}
+	data, err := readKeychainData(service, account)
+	if err != nil {
+		return nil, err
+	}
+	return parseCredentials(data)
 }
 
 func (tm *TokenManager) readFromFile() (*Credentials, error) {
@@ -69,9 +86,24 @@ func (tm *TokenManager) readFromFile() (*Credentials, error) {
 	if err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(filepath.Join(configDir, ".credentials.json"))
+	data, err := readCredentialFile(filepath.Join(configDir, ".credentials.json"))
 	if err != nil {
-		return nil, fmt.Errorf("read credentials file: %w", err)
+		return nil, errors.New("credential file unavailable")
 	}
 	return parseCredentials(data)
+}
+
+const maxCredentialDocument = 1024 * 1024
+
+func readCredentialFile(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, errors.New("credential file unavailable")
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxCredentialDocument+1))
+	if err != nil || len(data) > maxCredentialDocument {
+		return nil, errors.New("credential file unreadable")
+	}
+	return data, nil
 }

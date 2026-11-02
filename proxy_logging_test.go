@@ -25,8 +25,13 @@ func TestProxyHandler_doesNotLogSecrets_whenUpstreamRejectsRequest(t *testing.T)
 	previous := log.Writer()
 	log.SetOutput(&logs)
 	t.Cleanup(func() { log.SetOutput(previous) })
-	manager := NewTokenManager()
-	manager.creds = &Credentials{AccessToken: token, ExpiresAt: time.Now().Add(time.Hour).UnixMilli()}
+	manager, dir := isolatedTokenManager(t, func(req *http.Request) (*http.Response, error) {
+		t.Error("unexpected refresh")
+		return refreshResponse(req, http.StatusBadRequest, `{"error":"invalid_grant"}`), nil
+	})
+	creds := Credentials{AccessToken: token, ExpiresAt: time.Now().Add(time.Hour).UnixMilli()}
+	writeSourceCredentials(t, dir, creds)
+	manager.creds = &creds
 	handler := NewProxyHandler(manager)
 	handler.httpClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{

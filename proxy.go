@@ -116,7 +116,7 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if resp.StatusCode == http.StatusUnauthorized && mode != benchmarkMode {
 		resp.Body.Close()
 		log.Printf("[proxy] got 401, refreshing token and retrying...")
-		if err := p.tokenMgr.ForceRefresh(); err != nil {
+		if err := p.tokenMgr.ForceRefreshRejected(token); err != nil {
 			log.Printf("[proxy] force refresh failed")
 			http.Error(w, `{"error":"token refresh failed"}`, http.StatusServiceUnavailable)
 			return
@@ -251,6 +251,7 @@ func (p *ProxyHandler) handleHealth(w http.ResponseWriter) {
 	token, err := p.tokenMgr.GetValidToken()
 	status := "ok"
 	if err != nil {
+		log.Printf("[proxy] health credential unavailable")
 		status = "error: " + err.Error()
 	}
 
@@ -259,5 +260,7 @@ func (p *ProxyHandler) handleHealth(w http.ResponseWriter) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}
 
-	w.Write([]byte(`{"status":"` + status + `"}`))
+	json.NewEncoder(w).Encode(struct {
+		Status string `json:"status"`
+	}{status})
 }

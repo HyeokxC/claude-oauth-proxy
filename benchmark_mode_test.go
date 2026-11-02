@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -10,9 +11,14 @@ import (
 	"time"
 )
 
-func benchmarkHandler(transport roundTripFunc) *ProxyHandler {
-	manager := NewTokenManager()
-	manager.creds = &Credentials{AccessToken: "synthetic-token", ExpiresAt: time.Now().Add(time.Hour).UnixMilli()}
+func benchmarkHandler(t *testing.T, transport roundTripFunc) *ProxyHandler {
+	t.Helper()
+	manager, dir := isolatedTokenManager(t, func(req *http.Request) (*http.Response, error) {
+		return refreshResponse(req, http.StatusOK, syntheticRefreshSuccess), nil
+	})
+	creds := Credentials{AccessToken: "synthetic-token", RefreshToken: "synthetic-refresh", ExpiresAt: time.Now().Add(time.Hour).UnixMilli()}
+	writeSourceCredentials(t, dir, creds)
+	manager.creds = &creds
 	handler := NewProxyHandler(manager)
 	handler.httpClient.Transport = transport
 	return handler
@@ -37,9 +43,13 @@ func benchmarkRequest(t *testing.T, server *httptest.Server, path, mode string) 
 
 func TestBenchmarkMode_forwards401Once_whenRecognized(t *testing.T) {
 	attempts := 0
-	handler := benchmarkHandler(func(request *http.Request) (*http.Response, error) {
+	handler := benchmarkHandler(t, func(request *http.Request) (*http.Response, error) {
 		attempts++
 		return &http.Response{StatusCode: http.StatusUnauthorized, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":{"type":"authentication_error"}}`))}, nil
+	})
+	handler.tokenMgr.httpClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		t.Error("benchmark 401 must not trigger refresh")
+		return nil, errors.New("blocked benchmark refresh")
 	})
 	server := httptest.NewServer(handler)
 	defer server.Close()
@@ -56,8 +66,15 @@ func TestBenchmarkMode_forwards401Once_whenRecognized(t *testing.T) {
 
 func TestBenchmarkMode_preserves401Retry_whenAbsent(t *testing.T) {
 	attempts := 0
-	handler := benchmarkHandler(func(request *http.Request) (*http.Response, error) {
+	handler := benchmarkHandler(t, func(request *http.Request) (*http.Response, error) {
 		attempts++
+		want := "Bearer synthetic-token"
+		if attempts == 2 {
+			want = "Bearer synthetic-new-access"
+		}
+		if request.Header.Get("Authorization") != want {
+			t.Errorf("authorization did not rotate on retry")
+		}
 		status := http.StatusUnauthorized
 		if attempts == 2 {
 			status = http.StatusOK
@@ -75,7 +92,7 @@ func TestBenchmarkMode_preserves401Retry_whenAbsent(t *testing.T) {
 
 func TestBenchmarkMode_rejectsUnknownBeforeUpstream(t *testing.T) {
 	attempts := 0
-	handler := benchmarkHandler(func(request *http.Request) (*http.Response, error) {
+	handler := benchmarkHandler(t, func(request *http.Request) (*http.Response, error) {
 		attempts++
 		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
 	})
@@ -89,8 +106,10 @@ func TestBenchmarkMode_rejectsUnknownBeforeUpstream(t *testing.T) {
 }
 
 func TestBenchmarkMode_acknowledgesUnhealthyHealth(t *testing.T) {
-	manager := NewTokenManager()
-	manager.creds = &Credentials{ExpiresAt: time.Now().Add(time.Hour).UnixMilli()}
+	manager, _ := isolatedTokenManager(t, func(req *http.Request) (*http.Response, error) {
+		t.Error("unexpected refresh")
+		return nil, errors.New("blocked synthetic refresh")
+	})
 	server := httptest.NewServer(NewProxyHandler(manager))
 	defer server.Close()
 	request, err := http.NewRequest(http.MethodGet, server.URL+"/health", nil)
@@ -108,14 +127,17 @@ func TestBenchmarkMode_acknowledgesUnhealthyHealth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.StatusCode != http.StatusServiceUnavailable || response.Header.Get("X-CC-Proxy-Mode") != benchmarkMode || string(body) != `{"status":"ok"}` {
+	var health struct {
+		Status string `json:"status"`
+	}
+	if json.Unmarshal(body, &health) != nil || !strings.HasPrefix(health.Status, "error:") || strings.Contains(health.Status, "synthetic") || response.StatusCode != http.StatusServiceUnavailable || response.Header.Get("X-CC-Proxy-Mode") != benchmarkMode {
 		t.Fatalf("status=%d ack=%q body=%q", response.StatusCode, response.Header.Get("X-CC-Proxy-Mode"), body)
 	}
 }
 
 func TestBenchmarkMode_stripsInternalAndIdempotencyHeaders(t *testing.T) {
 	attempts := 0
-	handler := benchmarkHandler(func(request *http.Request) (*http.Response, error) {
+	handler := benchmarkHandler(t, func(request *http.Request) (*http.Response, error) {
 		attempts++
 		if request.Header.Get("X-CC-Proxy-Mode") != "" || request.Header.Get("Idempotency-Key") != "" || request.Header.Get("X-Idempotency-Key") != "" {
 			t.Errorf("internal marker or replay key forwarded: %v", request.Header)
@@ -152,7 +174,7 @@ func TestBenchmarkMode_stripsInternalAndIdempotencyHeaders(t *testing.T) {
 func TestBenchmarkMode_acknowledgesTransportErrorWithoutRetry(t *testing.T) {
 	attempts := 0
 	transportFailure := errors.New("synthetic transport failure")
-	handler := benchmarkHandler(func(request *http.Request) (*http.Response, error) {
+	handler := benchmarkHandler(t, func(request *http.Request) (*http.Response, error) {
 		attempts++
 		return nil, transportFailure
 	})
@@ -167,7 +189,7 @@ func TestBenchmarkMode_acknowledgesTransportErrorWithoutRetry(t *testing.T) {
 
 func TestBenchmarkMode_forwardsUpstreamErrorOnce(t *testing.T) {
 	attempts := 0
-	handler := benchmarkHandler(func(request *http.Request) (*http.Response, error) {
+	handler := benchmarkHandler(t, func(request *http.Request) (*http.Response, error) {
 		attempts++
 		return &http.Response{StatusCode: http.StatusInternalServerError, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":{"type":"api_error"}}`))}, nil
 	})
