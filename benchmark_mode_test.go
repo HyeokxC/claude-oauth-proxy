@@ -66,8 +66,21 @@ func TestBenchmarkMode_forwards401Once_whenRecognized(t *testing.T) {
 
 func TestBenchmarkMode_preserves401Retry_whenAbsent(t *testing.T) {
 	attempts := 0
+	var firstBody string
 	handler := benchmarkHandler(t, func(request *http.Request) (*http.Response, error) {
 		attempts++
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			return nil, err
+		}
+		if len(body) == 0 || request.ContentLength != int64(len(body)) {
+			t.Error("each upstream attempt must carry the complete nonempty body")
+		}
+		if attempts == 1 {
+			firstBody = string(body)
+		} else if string(body) != firstBody {
+			t.Error("upstream retry body differs from the first attempt")
+		}
 		want := "Bearer synthetic-token"
 		if attempts == 2 {
 			want = "Bearer synthetic-new-access"

@@ -105,7 +105,13 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := p.doUpstreamRequest(r, token)
+	body, err := prepareUpstreamBody(r)
+	if err != nil {
+		log.Printf("[proxy] upstream body preparation failed")
+		http.Error(w, `{"error":"upstream request failed"}`, http.StatusBadGateway)
+		return
+	}
+	resp, err := p.doUpstreamRequest(r, token, body)
 	if err != nil {
 		log.Printf("[proxy] upstream transport failed")
 		http.Error(w, `{"error":"upstream request failed"}`, http.StatusBadGateway)
@@ -127,7 +133,7 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"proxy credential unavailable"}`, http.StatusServiceUnavailable)
 			return
 		}
-		resp, err = p.doUpstreamRequest(r, token)
+		resp, err = p.doUpstreamRequest(r, token, body)
 		if err != nil {
 			log.Printf("[proxy] retry upstream transport failed")
 			http.Error(w, `{"error":"upstream retry failed"}`, http.StatusBadGateway)
@@ -198,7 +204,7 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (p *ProxyHandler) doUpstreamRequest(r *http.Request, token string) (*http.Response, error) {
+func prepareUpstreamBody(r *http.Request) ([]byte, error) {
 	// Read request body
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -211,7 +217,10 @@ func (p *ProxyHandler) doUpstreamRequest(r *http.Request, token string) (*http.R
 		body = TransformRequestBody(body)
 		LogSentBodySummary(body)
 	}
+	return body, nil
+}
 
+func (p *ProxyHandler) doUpstreamRequest(r *http.Request, token string, body []byte) (*http.Response, error) {
 	// Build upstream URL
 	upstreamURL := UpstreamBase + r.URL.Path
 	if r.URL.RawQuery != "" {
