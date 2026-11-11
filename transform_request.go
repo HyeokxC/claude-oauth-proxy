@@ -21,6 +21,11 @@ func TransformRequestHeaders(upstream *http.Request, original *http.Request, tok
 	upstream.Header.Del("Accept-Encoding")
 	upstream.Header.Del("Content-Length") // let Go set this from body size
 	upstream.Header.Del("Host")
+	upstream.Header.Del(benchmarkModeHeader)
+	if original.Header.Get(benchmarkModeHeader) == benchmarkMode {
+		upstream.Header.Del("Idempotency-Key")
+		upstream.Header.Del("X-Idempotency-Key")
+	}
 
 	// 1. Auth: remove x-api-key, set Bearer token
 	upstream.Header.Del("x-api-key")
