@@ -22,7 +22,7 @@ func TestProtocolHeaders_matchesNativeProfile_whenOpusRequestHasNoSession(t *tes
 	// Then: native SDK-CLI identity and one valid session, with no HTTP billing.
 	want := map[string]string{
 		"Authorization": "Bearer synthetic-access-token",
-		"User-Agent":    "claude-cli/2.1.282 (external, sdk-cli)",
+		"User-Agent":    "claude-cli/2.1.322 (external, sdk-cli)",
 		"x-app":         "cli",
 		"anthropic-dangerous-direct-browser-access": "true",
 		"anthropic-version":                         "2023-06-01",
@@ -40,10 +40,10 @@ func TestProtocolHeaders_matchesNativeProfile_whenOpusRequestHasNoSession(t *tes
 	}
 	if strings.Join(strings.Split(upstream.Header.Get("anthropic-beta"), ","), ",") != strings.Join([]string{
 		"claude-code-20250219", "oauth-2025-04-20", "interleaved-thinking-2025-05-14",
-		"thinking-token-count-2026-05-13", "context-management-2025-06-27",
-		"prompt-caching-scope-2026-01-05", "mid-conversation-system-2026-04-07",
-		"per-turn-control-2026-07-01", "mid-conversation-tool-changes-2026-07-01",
-		"effort-2025-11-24", "extended-cache-ttl-2025-04-11",
+		"context-management-2025-06-27", "per-turn-control-2026-07-01",
+		"mid-conversation-tool-changes-2026-07-01", "inline-tools-2026-09-15",
+		"advisor-tool-2026-03-01", "thinking-token-count-2026-05-13",
+		"advanced-tool-use-2025-11-20", "effort-2025-11-24", "extended-cache-ttl-2025-04-11",
 	}, ",") {
 		t.Errorf("native beta ordering mismatch: %q", upstream.Header.Get("anthropic-beta"))
 	}

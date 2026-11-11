@@ -124,7 +124,7 @@ func TransformRequestBody(body []byte) []byte {
 		}
 	}
 
-	if msg["model"] == "claude-opus-5-5" {
+	if usesNativeSystemBlocks(msg["model"]) {
 		addNativeSystemBlocks(msg)
 	} else {
 		transformSystemPrompt(msg)
@@ -136,6 +136,12 @@ func TransformRequestBody(body []byte) []byte {
 		return body
 	}
 	return result
+}
+
+// Fable models answer a bare 429 unless the body carries the native billing/identity blocks.
+func usesNativeSystemBlocks(model any) bool {
+	name, _ := model.(string)
+	return name == "claude-opus-5-5" || strings.HasPrefix(name, "claude-fable-")
 }
 
 func transformMessageContent(message map[string]any) {

@@ -39,12 +39,12 @@ func TestProtocolBody_billingFingerprint_whenShortFirstUserText(t *testing.T) {
 		t.Fatalf("system blocks = %d, want billing and identity", len(blocks))
 	}
 	text := blocks[0].(map[string]any)["text"].(string)
-	want := "x-anthropic-billing-header: cc_version=2.1.282.132; cc_entrypoint=sdk-cli;"
+	want := "x-anthropic-billing-header: cc_version=2.1.322.aaf; cc_entrypoint=sdk-cli;"
 	if text != want || len(text) != 74 {
 		t.Errorf("billing contract: got %q (%d bytes), want %q (74 bytes)", text, len(text), want)
 	}
 	sum := sha256.Sum256([]byte(text))
-	if hex.EncodeToString(sum[:]) != "48f9339824917500f0ab8f1131551a3648cdd4445a1d47f53946872ea3c27f68" {
+	if hex.EncodeToString(sum[:]) != "3b69c00aa7ac92ec31c7636895e1a17c8ede55dde86f7e56eebe040701b0796a" {
 		t.Errorf("billing block hash differs from native vector")
 	}
 }
@@ -58,7 +58,7 @@ func TestProtocolBody_usesUTF16CodeUnits_whenFirstUserTextHasAstralRune(t *testi
 
 	// Then: the high surrogate becomes U+FFFD when encoded alone for SHA-256.
 	text := blocks[0].(map[string]any)["text"].(string)
-	if !strings.Contains(text, "cc_version=2.1.282.160;") {
+	if !strings.Contains(text, "cc_version=2.1.322.156;") {
 		t.Errorf("UTF-16 billing fingerprint mismatch: %q", text)
 	}
 }
@@ -147,5 +147,25 @@ func TestProtocolBody_preservesUserContent_whenUserTextContainsCatalogMarkers(t 
 	message := body["messages"].([]any)[0].(map[string]any)
 	if message["content"] != "<available_skills>user-owned text</available_skills>" {
 		t.Error("user message text was altered")
+	}
+}
+
+func TestProtocolBody_addsNativeBlocks_whenModelIsFable(t *testing.T) {
+	for _, model := range []string{"claude-fable-5-2", "claude-fable-5-1"} {
+		t.Run(model, func(t *testing.T) {
+			// Given: a Fable request, which upstream rejects without native system blocks.
+			input := `{"model":"` + model + `","system":"caller instruction","messages":[{"role":"user","content":"OK"}]}`
+
+			// When: the request body is transformed.
+			blocks := protocolBlocks(t, protocolBody(t, input))
+
+			// Then: billing and SDK identity lead the caller's system text.
+			if len(blocks) != 3 ||
+				blocks[0].(map[string]any)["text"] != "x-anthropic-billing-header: cc_version=2.1.322.aaf; cc_entrypoint=sdk-cli;" ||
+				blocks[1].(map[string]any)["text"] != sdkIdentity ||
+				blocks[2].(map[string]any)["text"] != "caller instruction" {
+				t.Fatalf("native blocks missing: %v", blocks)
+			}
+		})
 	}
 }
