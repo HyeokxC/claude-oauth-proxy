@@ -20,22 +20,23 @@ OpenCode -> cc-proxy (127.0.0.1:34156) -> api.anthropic.com
 - 토큰이 만료되기 5분 전 갱신하고, upstream이 401을 반환하면 새 토큰으로 한 번 재시도합니다.
 - 갱신 전과 갱신 실패 후에는 처음 선택한 자격증명 저장소를 다시 확인합니다. CLI 재로그인으로 값이 바뀌었고 만료까지 5분 넘게 남았다면 실행 중인 프록시도 새 값을 사용합니다. 이미 메모리에서 갱신한 토큰을 변경되지 않은 저장소의 과거 값으로 되돌리지 않습니다.
 - 같은 토큰에 대한 동시 401은 갱신을 공유하며, 재시도 시 원래 요청 본문을 유지합니다. 401에서는 로컬 만료 시각이 남아 있어도 복구를 수행합니다.
-- 프록시의 갱신 결과는 메모리에만 보관하며 CLI 소유 Keychain/파일에는 쓰지 않습니다. 따라서 CLI와의 독립적인 토큰 회전 충돌이나 재시작 후 과거 저장소 토큰 문제까지 해결하는 공유 저장소 동기화 기능은 아닙니다. 두 프로세스의 갱신 충돌이 발생하면 CLI에서 재로그인이 필요할 수 있습니다.
+- 갱신에 성공하면 회전된 토큰을 처음 읽은 저장소(Keychain 또는 `.credentials.json`)에 다시 씁니다. `claudeAiOauth`의 토큰 필드(`accessToken`, `refreshToken`, `expiresAt`)만 바꾸고 나머지 필드는 보존하며, Keychain 값은 argv가 아니라 `security -i`의 stdin으로 전달합니다. 마지막으로 동기화한 뒤 저장소 값이 바뀌었다면(예: CLI 재로그인) 덮어쓰지 않고 로그만 남깁니다. 따라서 프록시가 갱신해도 CLI의 refresh token이 무효화되지 않습니다. 단, CLI가 동시에 독립적으로 갱신하는 경합까지 완전히 막지는 못하므로 드물게 재로그인이 필요할 수 있습니다.
 - `/health`의 200은 자격증명 확인 성공이며 실제 upstream 추론 성공을 보장하지 않습니다. `/health` 호출도 만료 임박 시 토큰 갱신을 시도할 수 있습니다.
 
 ## 요청 변환
 
-현재 구현은 Claude Code `2.1.282` 요청 프로필에 맞춰 동작하도록 고정되어 있습니다.
+현재 구현은 Claude Code `2.1.322` 요청 프로필에 맞춰 동작하도록 고정되어 있습니다.
 
 - `x-api-key`를 제거하고 OAuth Bearer 토큰을 `Authorization`에 넣습니다.
 - Claude Code용 `x-app`, `anthropic-dangerous-direct-browser-access`, `anthropic-version`, User-Agent를 설정합니다.
 - 유효한 `x-claude-code-session-id`가 없으면 세션 UUID를 생성합니다.
 - native beta 목록을 병합하고, 캡처된 프로필에 없는 `context-1m`과 structured outputs beta는 제거합니다.
-- `claude-opus-5-5` 요청에는 HTTP 빌링 헤더를 보내지 않습니다. 대신 본문 `system` 블록에 billing fingerprint와 Claude Agent SDK identity 블록을 추가합니다.
+- `claude-opus-5-5`와 `claude-fable-*` 요청에는 HTTP 빌링 헤더를 보내지 않습니다. 대신 본문 `system` 블록에 billing fingerprint와 Claude Agent SDK identity 블록을 추가합니다.
 - 일반 요청의 XML 시스템 프롬프트 일부를 Markdown 형태로 바꿉니다.
 - `todowrite`와 `background_output` 도구 이름을 각각 `task_write`와 `bg_output`으로 바꾸고, SSE 응답에서 원래 이름으로 되돌립니다.
 - `/messages`의 `max_tokens`는 `16384`으로 제한합니다.
 - upstream이 429를 반환하면 기본 15초 동안 새 요청을 잠시 중단합니다. upstream의 더 긴 `Retry-After` 값은 따릅니다.
+- upstream 연결, TLS handshake, 응답 헤더 대기는 각각 최대 120초로 제한합니다. 응답 본문에는 전체 시간 제한을 두지 않아 2분 넘는 SSE도 계속 전달하며, 호출자가 연결을 끊으면 upstream 요청도 취소합니다.
 
 Opus 5.5 동작은 OpenCode를 통한 검증을 기준으로 합니다. OpenCode의 자동 제목 생성 요청은 다른 모델을 사용할 수 있으며, 제목 생성 실패나 거부 응답은 본문 요청과 별개의 동작입니다. 비대화형 검증에서는 지원되는 경우 명시적인 제목 요청을 사용하세요.
 
@@ -102,6 +103,12 @@ go test ./...
 go test -v ./...
 ```
 
+타임아웃 회귀 테스트는 로컬 TLS upstream과 합성 자격증명으로 실행됩니다. 실제로 2분을 넘기는 SSE 시험은 별도로 켭니다.
+
+```bash
+CC_PROXY_LONG_STREAM_TEST=1 go test -run '^TestProxyTimeout_longSSEExceeds120Seconds$' -count=1 -timeout=150s -v ./...
+```
+
 ## 보안과 사용 제한
 
 - `127.0.0.1`에만 바인딩하고 포트를 외부에 노출하지 마세요.
@@ -111,7 +118,7 @@ go test -v ./...
 
 ## 버전 고정
 
-Claude Code 요청 프로필과 프로토콜은 `2.1.282`에 고정되어 있습니다. Claude Code가 바뀌면 `CCVersion`, 요청 변환, 프로토콜 테스트를 함께 갱신하고 실제 OpenCode 경로를 다시 검증해야 합니다.
+Claude Code 요청 프로필과 프로토콜은 `2.1.322`에 고정되어 있습니다. Claude Code가 바뀌면 `CCVersion`, 요청 변환, 프로토콜 테스트를 함께 갱신하고 실제 OpenCode 경로를 다시 검증해야 합니다.
 
 ## 라이선스
 
