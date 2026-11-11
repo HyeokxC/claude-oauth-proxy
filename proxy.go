@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -49,13 +50,20 @@ func NewProxyHandler(tokenMgr *TokenManager) *ProxyHandler {
 	return &ProxyHandler{
 		tokenMgr: tokenMgr,
 		httpClient: &http.Client{
-			Timeout: 120 * time.Second,
+			// No client-wide timeout: it also cuts off long-running SSE bodies.
+			// Bound connection setup and header waits independently instead.
 			Transport: &http.Transport{
-				TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
-				MaxIdleConns:        10,
-				IdleConnTimeout:     90 * time.Second,
-				DisableCompression:  true, // preserve SSE streaming
-				MaxIdleConnsPerHost: 10,
+				DialContext: (&net.Dialer{
+					Timeout:   120 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+				TLSHandshakeTimeout:   120 * time.Second,
+				ResponseHeaderTimeout: 120 * time.Second,
+				MaxIdleConns:          10,
+				IdleConnTimeout:       90 * time.Second,
+				DisableCompression:    true, // preserve SSE streaming
+				MaxIdleConnsPerHost:   10,
 			},
 			// Don't follow redirects
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
