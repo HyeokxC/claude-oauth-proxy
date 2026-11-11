@@ -36,8 +36,10 @@ type TokenManager struct {
 	creds      *Credentials
 	refreshing sync.Mutex
 	httpClient *http.Client
-	// Protected by refreshing; the CLI-owned source is read, never overwritten.
+	// Protected by refreshing. sourceCreds is the last value read from or written
+	// to the CLI-owned source; writes are skipped if the source changed since.
 	sourceReader func() (*Credentials, error)
+	sourceWriter func(*Credentials) error
 	sourceCreds  Credentials
 }
 
@@ -105,6 +107,7 @@ func (tm *TokenManager) loadCredentials() error {
 	creds, err := tm.readFromKeychain()
 	if err == nil && creds != nil {
 		tm.sourceReader = tm.readFromKeychain
+		tm.sourceWriter = tm.writeToKeychain
 		tm.sourceCreds = *creds
 		tm.mu.Lock()
 		tm.creds = creds
@@ -121,6 +124,7 @@ func (tm *TokenManager) loadCredentials() error {
 	}
 
 	tm.sourceReader = tm.readFromFile
+	tm.sourceWriter = tm.writeToFile
 	tm.sourceCreds = *creds
 	tm.mu.Lock()
 	tm.creds = creds
@@ -227,5 +231,19 @@ func (tm *TokenManager) refresh(rejected string) error {
 	tm.mu.Unlock()
 
 	log.Printf("[token] refreshed successfully (expires: %s)", time.UnixMilli(newCreds.ExpiresAt).Format(time.RFC3339))
+	tm.persistRefreshed(newCreds)
 	return nil
+}
+
+// The refresh token rotates, so the CLI's stored copy is dead unless we write it back.
+func (tm *TokenManager) persistRefreshed(creds *Credentials) {
+	if tm.sourceWriter == nil {
+		return
+	}
+	if err := tm.sourceWriter(creds); err != nil {
+		log.Printf("[token] credential source not updated: %v", err)
+		return
+	}
+	tm.sourceCreds = *creds
+	log.Printf("[token] wrote refreshed credentials back to original source")
 }
