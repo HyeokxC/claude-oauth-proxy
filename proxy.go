@@ -79,6 +79,10 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.handleHealth(w)
 		return
 	}
+	if r.URL.Path == "/usage" {
+		p.handleUsage(w, r)
+		return
+	}
 
 	// Short-circuit while we're cooling down from a recent upstream 429.
 	// Returning a synthetic 429 with Retry-After is the cleanest signal
