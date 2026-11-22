@@ -39,12 +39,12 @@ func TestProtocolBody_billingFingerprint_whenShortFirstUserText(t *testing.T) {
 		t.Fatalf("system blocks = %d, want billing and identity", len(blocks))
 	}
 	text := blocks[0].(map[string]any)["text"].(string)
-	want := "x-anthropic-billing-header: cc_version=2.1.322.aaf; cc_entrypoint=sdk-cli;"
+	want := "x-anthropic-billing-header: cc_version=2.1.330.d01; cc_entrypoint=sdk-cli;"
 	if text != want || len(text) != 74 {
 		t.Errorf("billing contract: got %q (%d bytes), want %q (74 bytes)", text, len(text), want)
 	}
 	sum := sha256.Sum256([]byte(text))
-	if hex.EncodeToString(sum[:]) != "3b69c00aa7ac92ec31c7636895e1a17c8ede55dde86f7e56eebe040701b0796a" {
+	if hex.EncodeToString(sum[:]) != "28275d055e5b9121560b088ceb9669418a305dd093da0b0f2d32cda96a632ff1" {
 		t.Errorf("billing block hash differs from native vector")
 	}
 }
@@ -58,7 +58,7 @@ func TestProtocolBody_usesUTF16CodeUnits_whenFirstUserTextHasAstralRune(t *testi
 
 	// Then: the high surrogate becomes U+FFFD when encoded alone for SHA-256.
 	text := blocks[0].(map[string]any)["text"].(string)
-	if !strings.Contains(text, "cc_version=2.1.322.156;") {
+	if !strings.Contains(text, "cc_version=2.1.330.a30;") {
 		t.Errorf("UTF-16 billing fingerprint mismatch: %q", text)
 	}
 }
@@ -161,7 +161,7 @@ func TestProtocolBody_addsNativeBlocks_whenModelIsFable(t *testing.T) {
 
 			// Then: billing and SDK identity lead the caller's system text.
 			if len(blocks) != 3 ||
-				blocks[0].(map[string]any)["text"] != "x-anthropic-billing-header: cc_version=2.1.322.aaf; cc_entrypoint=sdk-cli;" ||
+				blocks[0].(map[string]any)["text"] != "x-anthropic-billing-header: cc_version=2.1.330.d01; cc_entrypoint=sdk-cli;" ||
 				blocks[1].(map[string]any)["text"] != sdkIdentity ||
 				blocks[2].(map[string]any)["text"] != "caller instruction" {
 				t.Fatalf("native blocks missing: %v", blocks)

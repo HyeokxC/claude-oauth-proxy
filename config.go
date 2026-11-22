@@ -5,7 +5,7 @@ const (
 	UpstreamBase      = "https://api.anthropic.com"
 	OAuthClientID     = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 	TokenRefreshURL   = "https://platform.claude.com/v1/oauth/token"
-	CCVersion         = "2.1.322"
+	CCVersion         = "2.1.330"
 	AnthropicVersion  = "2023-06-01"
 
 	KeychainService = "Claude Code-credentials"

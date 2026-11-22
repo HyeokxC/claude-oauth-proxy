@@ -25,7 +25,7 @@ OpenCode -> cc-proxy (127.0.0.1:34156) -> api.anthropic.com
 
 ## 요청 변환
 
-현재 구현은 Claude Code `2.1.322` 요청 프로필에 맞춰 동작하도록 고정되어 있습니다.
+현재 구현은 Claude Code `2.1.330` 요청 프로필에 맞춰 동작하도록 고정되어 있습니다.
 
 - `x-api-key`를 제거하고 OAuth Bearer 토큰을 `Authorization`에 넣습니다.
 - Claude Code용 `x-app`, `anthropic-dangerous-direct-browser-access`, `anthropic-version`, User-Agent를 설정합니다.
@@ -122,7 +122,7 @@ CC_PROXY_LONG_STREAM_TEST=1 go test -run '^TestProxyTimeout_longSSEExceeds120Sec
 
 ## 버전 고정
 
-Claude Code 요청 프로필과 프로토콜은 `2.1.322`에 고정되어 있습니다. Claude Code가 바뀌면 `CCVersion`, 요청 변환, 프로토콜 테스트를 함께 갱신하고 실제 OpenCode 경로를 다시 검증해야 합니다.
+Claude Code 요청 프로필과 프로토콜은 `2.1.330`에 고정되어 있습니다. Claude Code가 바뀌면 `CCVersion`, 요청 변환, 프로토콜 테스트를 함께 갱신하고 실제 OpenCode 경로를 다시 검증해야 합니다.
 
 ## 라이선스
 

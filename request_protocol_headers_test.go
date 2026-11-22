@@ -22,7 +22,7 @@ func TestProtocolHeaders_matchesNativeProfile_whenOpusRequestHasNoSession(t *tes
 	// Then: native SDK-CLI identity and one valid session, with no HTTP billing.
 	want := map[string]string{
 		"Authorization": "Bearer synthetic-access-token",
-		"User-Agent":    "claude-cli/2.1.322 (external, sdk-cli)",
+		"User-Agent":    "claude-cli/2.1.330 (external, sdk-cli)",
 		"x-app":         "cli",
 		"anthropic-dangerous-direct-browser-access": "true",
 		"anthropic-version":                         "2023-06-01",
